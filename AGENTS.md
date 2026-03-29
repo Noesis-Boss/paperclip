@@ -39,6 +39,7 @@ Before making changes, read in this order:
 - `releases/`: release notes
 - `patches/`: pnpm dependency patches
 - `docker/`: Docker configuration
+- `report/`: generated analysis and audit reports
 
 ## 4. Dev Setup (Auto DB)
 
