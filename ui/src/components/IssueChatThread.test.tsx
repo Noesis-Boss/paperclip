@@ -5,7 +5,7 @@ import type { ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { IssueChatThread, resolveAssistantMessageFoldedState } from "./IssueChatThread";
+import { IssueChatThread, canStopIssueChatRun, resolveAssistantMessageFoldedState } from "./IssueChatThread";
 
 const { markdownEditorFocusMock } = vi.hoisted(() => ({
   markdownEditorFocusMock: vi.fn(),
@@ -449,6 +449,22 @@ describe("IssueChatThread", () => {
       isFoldable: true,
       previousMessageId: "message-1",
       previousIsFoldable: true,
+    })).toBe(false);
+  });
+
+  it("shows the stop-run action for active run-linked messages even without embedded run status", () => {
+    expect(canStopIssueChatRun({
+      runId: "run-1",
+      runStatus: null,
+      activeRunIds: new Set(["run-1"]),
+    })).toBe(true);
+  });
+
+  it("hides the stop-run action for completed historical runs", () => {
+    expect(canStopIssueChatRun({
+      runId: "run-1",
+      runStatus: "cancelled",
+      activeRunIds: new Set<string>(),
     })).toBe(false);
   });
 });

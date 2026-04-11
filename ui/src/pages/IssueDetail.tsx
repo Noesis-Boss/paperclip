@@ -1280,14 +1280,14 @@ export function IssueDetail() {
   const handleCancelQueuedComment = useCallback((commentId: string) => {
     if (commentId.startsWith("optimistic-")) {
       cancelledQueuedOptimisticCommentIdsRef.current.add(commentId);
-      let cancelledComment: OptimisticIssueComment | null = null;
+      let cancelledCommentBody: string | null = null;
       setOptimisticComments((current) => {
         const next = takeOptimisticIssueComment(current, commentId);
-        cancelledComment = next.comment;
+        cancelledCommentBody = next.comment?.body ?? null;
         return next.comments;
       });
-      if (cancelledComment) {
-        restoreQueuedCommentDraft(cancelledComment.body);
+      if (cancelledCommentBody) {
+        restoreQueuedCommentDraft(cancelledCommentBody);
         pushToast({
           title: "Queued comment canceled",
           body: "The queued message was restored to the composer.",
@@ -2296,6 +2296,10 @@ export function IssueDetail() {
                 }}
                 onCancelQueued={handleCancelQueuedComment}
                 interruptingQueuedRunId={interruptQueuedComment.isPending ? interruptQueuedComment.variables ?? null : null}
+                stoppingRunId={interruptQueuedComment.isPending ? interruptQueuedComment.variables ?? null : null}
+                onStopRun={async (runId) => {
+                  await interruptQueuedComment.mutateAsync(runId);
+                }}
                 onCancelRun={runningIssueRun
                   ? async () => {
                       await interruptQueuedComment.mutateAsync(runningIssueRun.id);
