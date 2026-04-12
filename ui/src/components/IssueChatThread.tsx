@@ -436,6 +436,11 @@ function parseReassignment(target: string): PaperclipIssueRuntimeReassignment | 
   return null;
 }
 
+function shouldImplicitlyReopenComment(issueStatus: string | undefined, assigneeValue: string) {
+  const isClosed = issueStatus === "done" || issueStatus === "cancelled";
+  return isClosed && assigneeValue.startsWith("agent:");
+}
+
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 
 function commentDateLabel(date: Date | string | undefined): string {
@@ -1609,7 +1614,6 @@ const IssueChatComposer = forwardRef<IssueChatComposerHandle, IssueChatComposerP
 }, forwardedRef) {
   const api = useAui();
   const [body, setBody] = useState("");
-  const [reopen, setReopen] = useState(issueStatus === "done" || issueStatus === "cancelled");
   const [submitting, setSubmitting] = useState(false);
   const [attaching, setAttaching] = useState(false);
   const effectiveSuggestedAssigneeValue = suggestedAssigneeValue ?? currentAssigneeValue;
@@ -1678,6 +1682,10 @@ const IssueChatComposer = forwardRef<IssueChatComposerHandle, IssueChatComposerP
 
     const hasReassignment = enableReassign && reassignTarget !== currentAssigneeValue;
     const reassignment = hasReassignment ? parseReassignment(reassignTarget) : undefined;
+    const reopen = shouldImplicitlyReopenComment(
+      issueStatus,
+      hasReassignment ? reassignTarget : currentAssigneeValue,
+    ) ? true : undefined;
     const submittedBody = trimmed;
     const viewportSnapshot = captureComposerViewportSnapshot(composerContainerRef.current);
 
@@ -1699,7 +1707,6 @@ const IssueChatComposer = forwardRef<IssueChatComposerHandle, IssueChatComposerP
       queueViewportRestore(viewportSnapshot);
       await appendPromise;
       if (draftKey) clearDraft(draftKey);
-      setReopen(issueStatus === "done" || issueStatus === "cancelled");
       setReassignTarget(effectiveSuggestedAssigneeValue);
     } catch {
       setBody((current) =>
@@ -1782,16 +1789,6 @@ const IssueChatComposer = forwardRef<IssueChatComposerHandle, IssueChatComposerP
             </Button>
           </div>
         ) : null}
-
-        <label className="flex items-center gap-1.5 text-xs text-muted-foreground cursor-pointer select-none">
-          <input
-            type="checkbox"
-            checked={reopen}
-            onChange={(event) => setReopen(event.target.checked)}
-            className="rounded border-border"
-          />
-          Re-open
-        </label>
 
         {enableReassign && reassignOptions.length > 0 ? (
           <InlineEntitySelector

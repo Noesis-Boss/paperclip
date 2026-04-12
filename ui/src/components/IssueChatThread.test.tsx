@@ -11,6 +11,10 @@ const { markdownEditorFocusMock } = vi.hoisted(() => ({
   markdownEditorFocusMock: vi.fn(),
 }));
 
+const { appendMock } = vi.hoisted(() => ({
+  appendMock: vi.fn(async () => undefined),
+}));
+
 const { threadMessagesMock } = vi.hoisted(() => ({
   threadMessagesMock: vi.fn(() => <div data-testid="thread-messages" />),
 }));
@@ -32,7 +36,7 @@ vi.mock("@assistant-ui/react", () => ({
     Content: () => null,
     Parts: () => null,
   },
-  useAui: () => ({ thread: () => ({ append: vi.fn() }) }),
+  useAui: () => ({ thread: () => ({ append: appendMock }) }),
   useAuiState: () => false,
   useMessage: () => ({
     id: "message",
@@ -126,6 +130,7 @@ describe("IssueChatThread", () => {
   afterEach(() => {
     container.remove();
     vi.useRealTimers();
+    appendMock.mockReset();
     markdownEditorFocusMock.mockReset();
     threadMessagesMock.mockReset();
   });
@@ -332,6 +337,64 @@ describe("IssueChatThread", () => {
     const editor = container.querySelector('textarea[aria-label="Issue chat editor"]') as HTMLTextAreaElement | null;
     expect(editor?.dataset.contentClassName).toContain("max-h-[28dvh]");
     expect(editor?.dataset.contentClassName).toContain("overflow-y-auto");
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("hides the reopen control and infers reopen for closed agent-assigned issue replies", async () => {
+    const root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <IssueChatThread
+            comments={[]}
+            linkedRuns={[]}
+            timelineEvents={[]}
+            liveRuns={[]}
+            issueStatus="done"
+            currentAssigneeValue="agent:agent-1"
+            onAdd={async () => {}}
+            enableLiveTranscriptPolling={false}
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    expect(container.textContent).not.toContain("Re-open");
+
+    const editor = container.querySelector('textarea[aria-label="Issue chat editor"]') as HTMLTextAreaElement | null;
+    const submitButton = Array.from(container.querySelectorAll("button")).find(
+      (element) => element.textContent === "Send",
+    ) as HTMLButtonElement | undefined;
+    expect(editor).not.toBeNull();
+    expect(submitButton).toBeDefined();
+
+    act(() => {
+      const valueSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLTextAreaElement.prototype,
+        "value",
+      )?.set;
+      valueSetter?.call(editor, "Please pick this back up");
+      editor?.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    await act(async () => {
+      submitButton?.click();
+    });
+
+    expect(appendMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        content: [{ type: "text", text: "Please pick this back up" }],
+        runConfig: {
+          custom: {
+            reopen: true,
+          },
+        },
+      }),
+    );
 
     act(() => {
       root.unmount();
