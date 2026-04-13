@@ -36,8 +36,10 @@ import { usePaperclipIssueRuntime, type PaperclipIssueRuntimeReassignment } from
 import {
   buildIssueChatMessages,
   formatDurationWords,
+  stabilizeThreadMessages,
   type IssueChatComment,
   type IssueChatLinkedRun,
+  type StableThreadMessageCacheEntry,
   type IssueChatTranscriptEntry,
   type SegmentTiming,
 } from "../lib/issue-chat-messages";
@@ -1925,8 +1927,7 @@ export function IssueChatThread({
   });
   const resolvedTranscriptByRun = transcriptsByRunId ?? transcriptByRun;
   const resolvedHasOutputForRun = hasOutputForRunOverride ?? hasOutputForRun;
-
-  const messages = useMemo(
+  const rawMessages = useMemo(
     () =>
       buildIssueChatMessages({
         comments,
@@ -1957,6 +1958,18 @@ export function IssueChatThread({
       currentUserId,
     ],
   );
+  const stableMessagesRef = useRef<readonly import("@assistant-ui/react").ThreadMessage[]>([]);
+  const stableMessageCacheRef = useRef<Map<string, StableThreadMessageCacheEntry>>(new Map());
+  const messages = useMemo(() => {
+    const stabilized = stabilizeThreadMessages(
+      rawMessages,
+      stableMessagesRef.current,
+      stableMessageCacheRef.current,
+    );
+    stableMessagesRef.current = stabilized.messages;
+    stableMessageCacheRef.current = stabilized.cache;
+    return stabilized.messages;
+  }, [rawMessages]);
 
   const isRunning = displayLiveRuns.some((run) => run.status === "queued" || run.status === "running");
   const feedbackVoteByTargetId = useMemo(() => {
