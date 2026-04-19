@@ -100,7 +100,11 @@ export function approvalRoutes(db: Db) {
       action: "approval.created",
       entityType: "approval",
       entityId: approval.id,
-      details: { type: approval.type, issueIds: uniqueIssueIds },
+      details: {
+        type: approval.type,
+        issueIds: uniqueIssueIds,
+        requestedByAgentId: approval.requestedByAgentId,
+      },
     });
 
     res.status(201).json(redactApprovalPayload(approval));
@@ -131,6 +135,12 @@ export function approvalRoutes(db: Db) {
       const linkedIssues = await issueApprovalsSvc.listIssuesForApproval(approval.id);
       const linkedIssueIds = linkedIssues.map((issue) => issue.id);
       const primaryIssueId = linkedIssueIds[0] ?? null;
+      // For hire_agent approvals, surface the newly-activated agent's id so
+      // downstream activity cards can deep-link to the agent detail page.
+      const payloadAgentId =
+        approval.type === "hire_agent"
+          ? ((approval.payload as Record<string, unknown> | null)?.agentId as string | undefined)
+          : undefined;
 
       await logActivity(db, {
         companyId: approval.companyId,
@@ -143,6 +153,7 @@ export function approvalRoutes(db: Db) {
           type: approval.type,
           requestedByAgentId: approval.requestedByAgentId,
           linkedIssueIds,
+          ...(payloadAgentId ? { hiredAgentId: payloadAgentId } : {}),
         },
       });
 
@@ -230,7 +241,10 @@ export function approvalRoutes(db: Db) {
         action: "approval.rejected",
         entityType: "approval",
         entityId: approval.id,
-        details: { type: approval.type },
+        details: {
+          type: approval.type,
+          requestedByAgentId: approval.requestedByAgentId,
+        },
       });
     }
 

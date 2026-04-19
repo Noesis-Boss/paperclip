@@ -70,45 +70,6 @@ function deriveTaskStatus(action: string, details?: Record<string, unknown> | nu
   }
 }
 
-function borderColorForStatus(status: string | null): string {
-  switch (status) {
-    case "todo": return "border-l-blue-500/50";
-    case "in_progress": return "border-l-yellow-500/50";
-    case "in_review": return "border-l-violet-500/50";
-    case "done": return "border-l-green-500/50";
-    case "blocked": return "border-l-red-500/50";
-    default: return "border-l-border";
-  }
-}
-
-function statusChip(action: string, details?: Record<string, unknown> | null) {
-  switch (action) {
-    case "issue.created":
-      return null;
-    case "issue.updated": {
-      const status = (details as Record<string, unknown> | null)?.status;
-      if (status === "in_review")
-        return { label: "For Review", className: "bg-violet-500/10 text-violet-600 dark:text-violet-400" };
-      return null;
-    }
-    case "approval.created":
-      return { label: "For Review", className: "bg-violet-500/10 text-violet-600 dark:text-violet-400" };
-    case "approval.approved":
-      return { label: "Approved", className: "bg-green-500/10 text-green-600 dark:text-green-400" };
-    case "approval.rejected":
-      return { label: "Changes Requested", className: "bg-red-500/10 text-red-600 dark:text-red-400" };
-    case "issue.document_created":
-    case "issue.document_updated":
-      return { label: "Document", className: "bg-blue-500/10 text-blue-600 dark:text-blue-400" };
-    case "issue.work_product_created":
-      return { label: "Deliverable", className: "bg-green-500/10 text-green-600 dark:text-green-400" };
-    case "agent.created":
-      return { label: "New Hire", className: "bg-purple-500/10 text-purple-600 dark:text-purple-400" };
-    default:
-      return null;
-  }
-}
-
 /* ------------------------------------------------------------------ */
 /*  Status Circle — matches StatusIcon rendering                       */
 /* ------------------------------------------------------------------ */
@@ -174,24 +135,54 @@ export function FeedCard({
   const docKey = details?.key as string | undefined;
   const summary = details?.summary as string | undefined;
 
+  // For approval events, resolve the agent name from requestedByAgentId
+  // so we show "Tax Advisor" instead of an opaque approval UUID.
+  const isApprovalEvent = event.entityType === "approval";
+  const approvalAgentId = details?.requestedByAgentId as string | undefined;
+  const approvalAgentName = approvalAgentId ? agentMap.get(approvalAgentId)?.name : undefined;
+
   const eventStatus = deriveTaskStatus(event.action, details);
   const currentStatus = entityStatusMap?.get(`${event.entityType}:${event.entityId}`) ?? null;
   const taskStatus = currentStatus ?? eventStatus;
   const isAgentEvent = event.action === "agent.created";
-  const chip = statusChip(event.action, details);
-  const borderColor = isAgentEvent ? "border-l-purple-500/50" : borderColorForStatus(taskStatus);
 
-  // Determine the display title
+  // Determine the display title. For approval events, prefer the requesting
+  // agent's name; if we can't resolve it (older events without the id in
+  // details), fall back to a generic label rather than leaking a raw UUID.
+  const approvalType = details?.type as string | undefined;
+  const approvalFallbackTitle =
+    approvalType === "agent_hire"
+      ? "Agent hire"
+      : approvalType
+        ? `Approval · ${approvalType}`
+        : "Approval request";
   const title = isAgentEvent
     ? (details?.name as string | undefined) ?? entityName ?? event.entityId
-    : docKey ?? entityTitle ?? entityName ?? event.entityId;
+    : isApprovalEvent
+      ? approvalAgentName ?? entityTitle ?? entityName ?? approvalFallbackTitle
+      : docKey ?? entityTitle ?? entityName ?? event.entityId;
 
-  // Link to permanent home
+  // Link to permanent home — deep-link to the specific document when applicable
+  const isDocEvent =
+    event.action === "issue.document_created" || event.action === "issue.document_updated";
+  const issueSlug = entityName ?? event.entityId;
+  // Approval cards: approved hire_agent → agent detail page; anything else
+  // (pending, rejected, or approved non-hire) → the approval detail page,
+  // which is where the Board takes action on it from the inbox.
+  const hiredAgentId = details?.hiredAgentId as string | undefined;
+  const approvalLink =
+    event.action === "approval.approved" && hiredAgentId
+      ? `/agents/${hiredAgentId}`
+      : `/approvals/${event.entityId}`;
   const link = event.entityType === "issue"
-    ? `/issues/${entityName ?? event.entityId}`
+    ? isDocEvent && docKey
+      ? `/issues/${issueSlug}#document-${encodeURIComponent(docKey)}`
+      : `/issues/${issueSlug}`
     : event.entityType === "agent"
       ? `/agents/${event.entityId}`
-      : null;
+      : event.entityType === "approval"
+        ? approvalLink
+        : null;
 
   // Status indicator for the body row
   const renderStatusIndicator = () => {
@@ -213,9 +204,8 @@ export function FeedCard({
   const card = (
     <div
       className={cn(
-        "mx-3 my-2 rounded-lg border border-l-[3px] bg-card p-3 text-xs transition-all",
-        borderColor,
-        link && "cursor-pointer hover:bg-accent/50 hover:shadow-sm",
+        "mx-3 my-2 rounded-lg border bg-card p-3 text-xs transition-all hover:bg-accent/50 hover:shadow-sm",
+        link && "cursor-pointer",
         className,
       )}
     >
@@ -233,20 +223,10 @@ export function FeedCard({
         </span>
       </div>
 
-      {/* Body: status indicator + title + chip */}
+      {/* Body: status indicator + title */}
       <div className="flex items-center gap-2">
         {renderStatusIndicator()}
         <span className="font-medium truncate">{title}</span>
-        {chip && (
-          <span
-            className={cn(
-              "inline-flex shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium leading-tight",
-              chip.className,
-            )}
-          >
-            {chip.label}
-          </span>
-        )}
       </div>
 
       {/* Optional summary */}
