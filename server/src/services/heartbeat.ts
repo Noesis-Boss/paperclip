@@ -81,6 +81,7 @@ const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 10;
+const MAX_DIAGNOSTIC_RETRIES = 2;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
@@ -397,6 +398,8 @@ const heartbeatRunListColumns = {
   processStartedAt: heartbeatRuns.processStartedAt,
   retryOfRunId: heartbeatRuns.retryOfRunId,
   processLossRetryCount: heartbeatRuns.processLossRetryCount,
+  diagnosticRetryCount: heartbeatRuns.diagnosticRetryCount,
+  contextSnapshot: heartbeatRuns.contextSnapshot,
   createdAt: heartbeatRuns.createdAt,
   updatedAt: heartbeatRuns.updatedAt,
 } as const;
@@ -1392,7 +1395,10 @@ function buildProcessLossMessage(run: {
   return "Process lost -- server may have restarted";
 }
 
-function truncateDisplayId(value: string | null | undefined, max = 128) {
+function truncateDisplayId(
+  value: string | null | undefined,
+  max = 128,
+) {
   if (!value) return null;
   return value.length > max ? value.slice(0, max) : value;
 }
@@ -2701,7 +2707,7 @@ export function heartbeatService(db: Db) {
     const nextStatus =
       runningCount > 0
         ? "running"
-        : outcome === "succeeded" || outcome === "cancelled"
+        : outcome === "succeeded"
           ? "idle"
           : "error";
 
@@ -3303,16 +3309,16 @@ export function heartbeatService(db: Db) {
     const resetTaskSession = shouldResetTaskSessionForWake(context);
     const sessionResetReason = describeSessionResetReason(context);
     const taskSessionForRun = resetTaskSession ? null : taskSession;
-    const explicitResumeSessionParams = normalizeSessionParams(
+    const explicitResumeSession = normalizeSessionParams(
       sessionCodec.deserialize(parseObject(context.resumeSessionParams)),
     );
     const explicitResumeSessionDisplayId = truncateDisplayId(
       readNonEmptyString(context.resumeSessionDisplayId) ??
-        (sessionCodec.getDisplayId ? sessionCodec.getDisplayId(explicitResumeSessionParams) : null) ??
-        readNonEmptyString(explicitResumeSessionParams?.sessionId),
+        (sessionCodec.getDisplayId ? sessionCodec.getDisplayId(explicitResumeSession) : null) ??
+        readNonEmptyString(explicitResumeSession?.sessionId),
     );
     const previousSessionParams =
-      explicitResumeSessionParams ??
+      explicitResumeSession ??
       (explicitResumeSessionDisplayId ? { sessionId: explicitResumeSessionDisplayId } : null) ??
       normalizeSessionParams(sessionCodec.deserialize(taskSessionForRun?.sessionParamsJson ?? null));
     const config = parseObject(agent.adapterConfig);
@@ -3511,7 +3517,6 @@ export function heartbeatService(db: Db) {
               baseRef: executionWorkspace.repoRef,
               projectId: resolvedProjectId,
               projectWorkspaceId: resolvedProjectWorkspaceId,
-              sourceIssueId: issueRef?.id ?? null,
               metadata: {
                 createdByRuntime: true,
                 source: executionWorkspace.source,
@@ -3645,8 +3650,7 @@ export function heartbeatService(db: Db) {
       explicitResumeSessionDisplayId ??
         taskSessionForRun?.sessionDisplayId ??
         (sessionCodec.getDisplayId ? sessionCodec.getDisplayId(runtimeSessionParams) : null) ??
-        readNonEmptyString(runtimeSessionParams?.sessionId) ??
-        runtimeSessionFallback,
+        readNonEmptyString(runtimeSessionParams?.sessionId),
     );
     let runtimeSessionIdForAdapter =
       readNonEmptyString(runtimeSessionParams?.sessionId) ?? runtimeSessionFallback;
@@ -3809,9 +3813,13 @@ export function heartbeatService(db: Db) {
         onLog,
       });
       if (runtimeServices.length > 0) {
-        context.paperclipRuntimeServices = runtimeServices;
+        const combinedRuntimeServices = [
+          ...runtimeServices,
+          ...adapterManagedRuntimeServices,
+        ];
+        context.paperclipRuntimeServices = combinedRuntimeServices;
         context.paperclipRuntimePrimaryUrl =
-          runtimeServices.find((service) => readNonEmptyString(service.url))?.url ?? null;
+          combinedRuntimeServices.find((service) => readNonEmptyString(service.url))?.url ?? null;
         await db
           .update(heartbeatRuns)
           .set({
@@ -4044,7 +4052,7 @@ export function heartbeatService(db: Db) {
 
       const finalizedRun = await getRun(run.id);
       if (finalizedRun) {
-        await appendRunEvent(finalizedRun, seq++, {
+        await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
           eventType: "lifecycle",
           stream: "system",
           level: outcome === "succeeded" ? "info" : "error",
@@ -4072,11 +4080,14 @@ export function heartbeatService(db: Db) {
         }
         await finalizeIssueCommentPolicy(finalizedRun, agent);
         await releaseIssueExecutionAndPromote(finalizedRun);
+        if (outcome !== "succeeded" && finalizedRun.status !== "cancelled") {
+          void maybeEnqueueDiagnosticRetry(db, enqueueWakeup, finalizedRun, agent);
+        }
       }
 
       if (finalizedRun) {
         await updateRuntimeState(agent, finalizedRun, adapterResult, {
-          legacySessionId: nextSessionState.legacySessionId,
+          legacySessionId: runtimeForAdapter.sessionId,
         }, normalizedUsage);
         if (taskKey) {
           if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
@@ -4139,7 +4150,9 @@ export function heartbeatService(db: Db) {
         });
         await finalizeIssueCommentPolicy(failedRun, agent);
         await releaseIssueExecutionAndPromote(failedRun);
+      }
 
+      if (failedRun) {
         await updateRuntimeState(agent, failedRun, {
           exitCode: null,
           signal: null,
@@ -4148,15 +4161,14 @@ export function heartbeatService(db: Db) {
         }, {
           legacySessionId: runtimeForAdapter.sessionId,
         });
-
-        if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)) {
+        if (taskKey && (previousSessionParams || previousDisplayId || taskSession)) {
           await upsertTaskSession({
             companyId: agent.companyId,
             agentId: agent.id,
             adapterType: agent.adapterType,
             taskKey,
             sessionParamsJson: previousSessionParams,
-            sessionDisplayId: previousSessionDisplayId,
+            sessionDisplayId: previousDisplayId,
             lastRunId: failedRun.id,
             lastError: message,
           });
@@ -4581,18 +4593,6 @@ export function heartbeatService(db: Db) {
           activeExecutionRun = null;
         }
 
-        if (!activeExecutionRun && issue.executionRunId) {
-          await tx
-            .update(issues)
-            .set({
-              executionRunId: null,
-              executionAgentNameKey: null,
-              executionLockedAt: null,
-              updatedAt: new Date(),
-            })
-            .where(eq(issues.id, issue.id));
-        }
-
         if (!activeExecutionRun) {
           const legacyRun = await tx
             .select()
@@ -4680,12 +4680,6 @@ export function heartbeatService(db: Db) {
             return { kind: "coalesced" as const, run: mergedRun };
           }
 
-          const deferredPayload = {
-            ...(payload ?? {}),
-            issueId,
-            [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot,
-          };
-
           const existingDeferred = await tx
             .select()
             .from(agentWakeupRequests)
@@ -4732,8 +4726,8 @@ export function heartbeatService(db: Db) {
             agentId,
             source,
             triggerDetail,
-            reason: "issue_execution_deferred",
-            payload: deferredPayload,
+            reason,
+            payload,
             status: "deferred_issue_execution",
             requestedByActorType: opts.requestedByActorType ?? null,
             requestedByActorId: opts.requestedByActorId ?? null,
@@ -5405,4 +5399,78 @@ export function heartbeatService(db: Db) {
       return run ?? null;
     },
   };
+}
+
+async function maybeEnqueueDiagnosticRetry(
+  db: Db,
+  enqueueWakeup: (agentId: string, opts: WakeupOptions) => Promise<typeof heartbeatRuns.$inferSelect | null>,
+  failedRun: typeof heartbeatRuns.$inferSelect,
+  agent: typeof agents.$inferSelect,
+): Promise<void> {
+  const currentRetryCount = failedRun.diagnosticRetryCount ?? 0;
+  if (currentRetryCount >= MAX_DIAGNOSTIC_RETRIES) return;
+
+  type DiagnosticResult = {
+    category: string;
+    canRetry: boolean;
+    suggestedFix: string | null;
+  };
+
+  function classifyFailure(error: string, exitCode: number | null, signal: string | null): DiagnosticResult {
+    const lowerError = (error ?? "").toLowerCase();
+    if (signal === "SIGKILL" || signal === "SIGTERM" || (exitCode === null && signal !== null)) {
+      return { category: "process_killed", canRetry: true, suggestedFix: null };
+    }
+    if (lowerError.includes("enoent") || lowerError.includes("no such file") || lowerError.includes("not found")) {
+      return { category: "not_found", canRetry: false, suggestedFix: null };
+    }
+    if (lowerError.includes("permission denied")) {
+      return { category: "permission_denied", canRetry: false, suggestedFix: null };
+    }
+    if (lowerError.includes("rate limit") || lowerError.includes("429") || lowerError.includes("rate_limit")) {
+      return { category: "rate_limit", canRetry: true, suggestedFix: "Wait and retry on next heartbeat interval" };
+    }
+    if (lowerError.includes("timeout") || lowerError.includes("etimedout") || lowerError.includes("timed out")) {
+      return { category: "timeout", canRetry: true, suggestedFix: null };
+    }
+    if (lowerError.includes("empty response") || lowerError.includes("econnreset") || lowerError.includes("ECONNRESET")) {
+      return { category: "network_error", canRetry: true, suggestedFix: null };
+    }
+    if (lowerError.includes("eof") || lowerError.includes("end of file")) {
+      return { category: "eof_error", canRetry: true, suggestedFix: null };
+    }
+    if (lowerError.includes("out of memory") || lowerError.includes("oom")) {
+      return { category: "oom", canRetry: false, suggestedFix: null };
+    }
+    return { category: "unknown", canRetry: false, suggestedFix: null };
+  }
+
+  const classification = classifyFailure(failedRun.error ?? "", failedRun.exitCode ?? null, failedRun.signal ?? null);
+  if (!classification.canRetry) return;
+
+  const queued = await enqueueWakeup(agent.id, {
+    source: "automation",
+    triggerDetail: "system",
+    reason: "diagnostic_retry",
+    requestedByActorType: "system",
+    requestedByActorId: "heartbeat_service",
+    contextSnapshot: {
+      source: "scheduler",
+      reason: "diagnostic_retry",
+      failedRunId: failedRun.id,
+      diagnosticRetryCount: currentRetryCount + 1,
+      category: classification.category,
+      analysis: classification.suggestedFix ?? "",
+      originalError: failedRun.error ?? "",
+    },
+  });
+
+  if (!queued) return;
+
+  await db.update(heartbeatRuns).set({ diagnosticRetryCount: currentRetryCount + 1 }).where(eq(heartbeatRuns.id, queued.id));
+
+  logger.info(
+    { runId: failedRun.id, diagnosticRunId: queued.id, category: classification.category },
+    "enqueued diagnostic retry",
+  );
 }
